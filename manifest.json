@@ -1,7 +1,7 @@
 {
     "display_name": "TODO API",
     "plugin_id": "kira-ai-plugin-todo-api",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "A simple TODO API plugin for managing tasks",
     "author": "xxynet",
     "repo": "https://github.com/xxynet/kira-ai-plugin-todo-api",
