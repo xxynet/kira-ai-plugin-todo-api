@@ -17,18 +17,18 @@ class MyPlugin(BasePlugin):
         super().__init__(ctx, cfg)
 
     async def initialize(self):
-        self.server_url = self.plugin_cfg.get("server_url").rstrip("/")
+        self.server_url = (self.plugin_cfg.get("server_url") or "").rstrip("/")
         self.username = self.plugin_cfg.get("username")
         self.password = self.plugin_cfg.get("password")
         self._token = None
         self._refresh_token = None
         self._client = httpx.AsyncClient(base_url=self.server_url)
-        if any(not v for v in [self.server_url, self.username, self.password]):
-            logger.error("[todo-api] Missing required configuration parameters: server_url, username, password")
-            return
         await self._login()
 
-    async def _login(self):
+    async def _login(self) -> bool:
+        if not all((self.server_url, self.username, self.password)):
+            logger.error("[todo-api] Missing required configuration parameters: server_url, username, password")
+            return False
         try:
             resp = await self._client.post(
                 "/api/v1/auth/login",
@@ -36,11 +36,17 @@ class MyPlugin(BasePlugin):
             )
             resp.raise_for_status()
             data = resp.json()
-            self._token = data.get("access_token")
+            access_token = data.get("access_token")
+            if not access_token:
+                logger.warning("[todo-api] Login response is missing an access token")
+                return False
+            self._token = access_token
             self._refresh_token = data.get("refresh_token")
             logger.info("[todo-api] Login OK")
+            return True
         except Exception as e:
             logger.error(f"[todo-api] Login failed: {e}")
+            return False
 
     async def _refresh(self) -> bool:
         """Refresh the access token using the refresh token."""
@@ -55,7 +61,11 @@ class MyPlugin(BasePlugin):
                 logger.warning(f"[todo-api] Token refresh failed: {resp.status_code}")
                 return False
             data = resp.json()
-            self._token = data.get("access_token")
+            access_token = data.get("access_token")
+            if not access_token:
+                logger.warning("[todo-api] Refresh response is missing an access token")
+                return False
+            self._token = access_token
             self._refresh_token = data.get("refresh_token") or self._refresh_token
             logger.info("[todo-api] Token refreshed")
             return True
@@ -75,7 +85,10 @@ class MyPlugin(BasePlugin):
 
     @register.tool(
         name="get_openapi_spec",
-        description="Retrieve the OpenAPI specification for the TODO API",
+        description=(
+            "Retrieve the TODO API OpenAPI specification to find task endpoints and request formats. "
+            "The plugin handles authentication; do not call login or token endpoints from the specification."
+        ),
         params={"type": "object", "properties": {}},
     )
     async def get_openapi_spec(self, *args, **kwargs):
@@ -84,7 +97,11 @@ class MyPlugin(BasePlugin):
 
     @register.tool(
         name="todo_api_request",
-        description="Make a request to the TODO API",
+        description=(
+            "Make a request to a TODO API task endpoint. The plugin logs in, attaches, and refreshes its token automatically. "
+            "Do not call login or token endpoints, ask for credentials, or pass credentials, tokens, "
+            "or Authorization headers."
+        ),
         params={
             "type": "object",
             "properties": {
@@ -99,6 +116,12 @@ class MyPlugin(BasePlugin):
         path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
         m = method.upper()
         await self._ensure_token()
+        if not self._token:
+            return {
+                "status": "error",
+                "code": "auth_unavailable",
+                "message": "The plugin is not authenticated. Check the TODO API plugin configuration and startup logs.",
+            }
 
         async def _do_request(auth):
             if m == "GET":
@@ -113,20 +136,28 @@ class MyPlugin(BasePlugin):
                 return await self._client.patch(path, json=data, auth=auth)
             return None
 
-        auth = BearerAuth(self._token) if self._token else None
-        resp = await _do_request(auth)
+        resp = await _do_request(BearerAuth(self._token))
         if resp is None:
             return {"status": "error", "message": f"Unsupported HTTP method: {method}"}
-        # 401: access token 可能过期，刷新后重试一次
-        if resp.status_code == 401:
-            if await self._refresh():
-                resp = await _do_request(BearerAuth(self._token))
-            else:
-                await self._login()
-                if self._token:
-                    resp = await _do_request(BearerAuth(self._token))
+        if resp.status_code == 401 and (await self._refresh() or await self._login()):
+            resp = await _do_request(BearerAuth(self._token))
         try:
             body = resp.json()
         except Exception:
             body = resp.text
-        return {"status": "success", "status_code": resp.status_code, "data": body}
+        result = {
+            "status": "error" if resp.is_error else "success",
+            "status_code": resp.status_code,
+            "data": body,
+        }
+        if resp.status_code == 401:
+            result.update(
+                code="auth_unauthorized",
+                message="The server rejected the plugin's authentication. Check the TODO API plugin configuration.",
+            )
+        elif resp.status_code == 403:
+            result.update(
+                code="auth_forbidden",
+                message="The configured TODO API account does not have permission for this request.",
+            )
+        return result
